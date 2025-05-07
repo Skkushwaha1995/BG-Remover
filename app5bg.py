@@ -1,138 +1,168 @@
+# NOTE: This script requires 'streamlit', 'rembg', and other dependencies to be installed in the environment.
+# Ensure they are available before running this file.
+
 import os
-import streamlit as st
-from rembg import remove
-from PIL import Image
-import tempfile
 import zipfile
 from io import BytesIO
+from PIL import Image
+import requests
+
+try:
+    import streamlit as st
+    from rembg import remove
+except ModuleNotFoundError as e:
+    print(f"⚠️ Required module not found: {e.name}. Please install it using: pip install streamlit rembg pillow requests")
+    exit()
 
 WHITE_COLOR = (255, 255, 255)
 
 def compress_and_resize(image, size):
     image = image.resize(size, Image.Resampling.LANCZOS)
-    compressed_image = Image.new('RGB', image.size, WHITE_COLOR)
-    compressed_image.paste(image, (0, 0))
-    return compressed_image
+    canvas = Image.new('RGB', image.size, WHITE_COLOR)
+    canvas.paste(image, (0, 0), image if image.mode == 'RGBA' else None)
+    return canvas
 
 def remove_background(image):
-    return remove(image)
+    return remove(image, alpha_matting=True,
+                  alpha_matting_foreground_threshold=240,
+                  alpha_matting_background_threshold=10,
+                  alpha_matting_erode_size=10)
 
-def add_white_background(image, background_color=WHITE_COLOR):
+def add_bg(image, color):
     if image.mode == 'RGBA':
-        background = Image.new('RGB', image.size, background_color)
-        background.paste(image, (0, 0), image)
-        return background
+        bg = Image.new('RGB', image.size, color)
+        bg.paste(image, (0, 0), image)
+        return bg
     return image.convert('RGB')
 
-def process_images(images, base_name, output_size, add_bg=False):
-    results = []
+def download_image_from_url(url):
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        return BytesIO(resp.content)
+    except Exception as e:
+        st.warning(f"⚠️ Couldn't fetch {url}: {e}")
+        return None
 
-    for idx, file in enumerate(images, start=1):
-        img = Image.open(file)
-        output_image = remove_background(img)
-        if add_bg:
-            output_image = add_white_background(output_image)
-        output_image = compress_and_resize(output_image, output_size)
+def process_images(files, base, size, replace_bg, bg_color):
+    out = []
+    for idx, f in enumerate(files, 1):
+        img = Image.open(f)
+        img = remove_background(img)
+        if replace_bg:
+            img = add_bg(img, bg_color)
+        img = compress_and_resize(img, size)
+        name = f"{base}_{idx}.png"
+        buf = BytesIO()
+        img.save(buf, "PNG", optimize=True, quality=85)
+        buf.seek(0)
+        out.append({"name": name, "buf": buf, "img": img})
+    return out
 
-        filename = f"{base_name}_{idx}.png"
-        buffer = BytesIO()
-        output_image.save(buffer, format="PNG", quality=85, optimize=True)
-        buffer.seek(0)
-        file_size_kb = len(buffer.getvalue()) // 1024
-        results.append({
-            "filename": filename,
-            "buffer": buffer,
-            "size_kb": file_size_kb,
-            "image": output_image
-        })
-
-    return results
-
-# --- Streamlit App ---
-
+# Streamlit UI
 st.title("🖼️ Background Remover")
 
-# Session state setup
-if "processed_images" not in st.session_state:
-    st.session_state["processed_images"] = []
-if "uploaded_files" not in st.session_state:
-    st.session_state["uploaded_files"] = []
+# File Upload
+st.subheader("📁 Upload Images from Your Computer")
+uploaded = st.file_uploader("Choose images to upload", type=["png", "jpg", "jpeg", "bmp"], accept_multiple_files=True)
+if uploaded:
+    st.session_state["files"] = uploaded
 
-# Upload images
-uploaded_files = st.file_uploader("Upload Images", type=["png", "jpg", "jpeg", "bmp"], accept_multiple_files=True)
+# URL Input
+st.markdown("---")
+st.subheader("🌐 Or Enter Image URLs (one per line)")
+urls = st.text_area("Enter image URLs", height=120)
+if st.button("▶️ Preview URL Images"):
+    raw = []
+    for url in [u.strip() for u in urls.splitlines() if u.strip()]:
+        buf = download_image_from_url(url)
+        if buf:
+            buf.name = os.path.basename(url) or f"url_{len(raw)+1}"
+            raw.append(buf)
+    st.session_state["raw_urls"] = raw
 
-if uploaded_files:
-    st.session_state.uploaded_files = uploaded_files
-
-if st.session_state.uploaded_files:
-    st.subheader("🖼️ Preview Uploaded Images")
+# Preview & Process URL Images
+if st.session_state.get("raw_urls"):
+    st.markdown("**Preview Raw URL Images**")
     cols = st.columns(4)
-    for idx, file in enumerate(st.session_state.uploaded_files):
-        with cols[idx % 4]:
-            st.image(file, caption=os.path.basename(file.name), use_container_width=True)
+    for i, buf in enumerate(st.session_state["raw_urls"]):
+        with cols[i % 4]:
+            st.image(buf, use_container_width=True, caption=getattr(buf, "name", f"URL_{i+1}"))
 
-    st.markdown("---")
-    base_name = st.text_input("🔤 Enter base name for all output files", value="cleaned_image")
+    base_url = st.text_input("Base name for URL images", value="url_image")
+    w_url = st.number_input("Width (URL images)", 50, 2000, 500, key="w_url")
+    h_url = st.number_input("Height (URL images)", 50, 2000, 500, key="h_url")
+    bg_choice_url = st.radio("URL Background:", ["Remove Background", "Replace with Color"], key="bg_url")
+    replace_bg_url = bg_choice_url.startswith("Replace")
+    color_url = None
+    if replace_bg_url:
+        hexc = st.color_picker("Pick URL BG Color", "#ffffff", key="col_url")
+        color_url = tuple(int(hexc.lstrip("#")[i:i+2], 16) for i in (0, 2, 4))
 
-    col1, col2 = st.columns(2)
-    with col1:
-        width = st.number_input("📏 Width", min_value=50, max_value=1000, value=500)
-    with col2:
-        height = st.number_input("📏 Height", min_value=50, max_value=1000, value=500)
+    if st.button("✅ Process URL Images"):
+        processed = process_images(
+            st.session_state["raw_urls"],
+            base_url, (w_url, h_url),
+            replace_bg_url, color_url or WHITE_COLOR
+        )
+        st.session_state["proc_urls"] = processed
+        st.success("✅ URL Images Processed")
 
-    bg_choice = st.radio("🧼 Background option", ["Remove Background", "Replace with White Background"])
-    add_bg = bg_choice == "Replace with White Background"
-
-    if st.button("✅ Process Images"):
-        with st.spinner("Processing..."):
-            results = process_images(st.session_state.uploaded_files, base_name, (width, height), add_bg=add_bg)
-            st.session_state.processed_images = results
-        st.success("All images processed!")
-
-# Show processed images
-if st.session_state.processed_images:
-    st.subheader("🖼️ Processed Images")
-
-    selected_filenames = st.multiselect(
-        "✅ Select images to download individually:",
-        [img["filename"] for img in st.session_state.processed_images],
-        default=[img["filename"] for img in st.session_state.processed_images]
-    )
-
+# Display Processed URL Images
+if st.session_state.get("proc_urls"):
+    st.subheader("🖼️ Processed URL Images")
     cols = st.columns(4)
-    for idx, img_info in enumerate(st.session_state.processed_images):
-        with cols[idx % 4]:
-            st.image(img_info["image"], caption=f"{img_info['filename']} ({img_info['size_kb']} KB)", use_container_width=True)
-            if img_info["filename"] in selected_filenames:
-                st.download_button(
-                    label=f"⬇️ Download",
-                    data=img_info["buffer"],
-                    file_name=img_info["filename"],
-                    mime="image/png",
-                    key=f"download_{img_info['filename']}"
-                )
+    for i, info in enumerate(st.session_state["proc_urls"]):
+        with cols[i % 4]:
+            st.image(info["img"], use_container_width=True, caption=info["name"])
+            st.download_button("⬇️ Download", data=info["buf"], file_name=info["name"], mime="image/png", key=f"dl_url_{i}")
 
-    # Download all ZIP
-    zip_buffer = BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w") as zipf:
-        for img_info in st.session_state.processed_images:
-            zipf.writestr(img_info["filename"], img_info["buffer"].getvalue())
-    zip_buffer.seek(0)
+    zipb = BytesIO()
+    with zipfile.ZipFile(zipb, "w") as zf:
+        for info in st.session_state["proc_urls"]:
+            zf.writestr(info["name"], info["buf"].getvalue())
+    zipb.seek(0)
+    st.download_button("📦 Download All URLs ZIP", data=zipb, file_name="urls_processed.zip", mime="application/zip")
 
-    st.download_button(
-        label="📦 Download All as ZIP",
-        data=zip_buffer,
-        file_name="processed_images.zip",
-        mime="application/zip"
-    )
-
-    # OPTIONAL – Download All Individually
-    if st.button("⬇️ Download All Individually (No ZIP)"):
-        ...
-        # This part already in your script
-
-    # 🔽 PLACE NEW CODE HERE
+# Display & Process Local Files
+if st.session_state.get("files"):
     st.markdown("---")
-    st.subheader("🌐 Download Links for External Use")
-    ...
-    # Copyable Links Code
+    st.subheader("🖼️ Preview Local Uploads")
+    cols = st.columns(4)
+    for i, up in enumerate(st.session_state["files"]):
+        with cols[i % 4]:
+            st.image(up, use_container_width=True, caption=up.name)
+
+    base_f = st.text_input("Base name for local images", "cleaned", key="base_f")
+    w_f = st.number_input("Width (local)", 50, 2000, 500, key="w_f")
+    h_f = st.number_input("Height (local)", 50, 2000, 500, key="h_f")
+    bg_choice_f = st.radio("Local Background:", ["Remove Background", "Replace with Color"], key="bg_f")
+    replace_bg_f = bg_choice_f.startswith("Replace")
+    color_f = None
+    if replace_bg_f:
+        hexf = st.color_picker("Pick Local BG Color", "#ffffff", key="col_f")
+        color_f = tuple(int(hexf.lstrip("#")[i:i+2], 16) for i in (0, 2, 4))
+
+    if st.button("✅ Process Local Images"):
+        processed = process_images(
+            st.session_state["files"],
+            base_f, (w_f, h_f),
+            replace_bg_f, color_f or WHITE_COLOR
+        )
+        st.session_state["proc_files"] = processed
+        st.success("✅ Local Images Processed")
+
+if st.session_state.get("proc_files"):
+    st.subheader("🖼️ Processed Local Images")
+    cols = st.columns(4)
+    for i, info in enumerate(st.session_state["proc_files"]):
+        with cols[i % 4]:
+            st.image(info["img"], use_container_width=True, caption=info["name"])
+            st.download_button("⬇️ Download", data=info["buf"], file_name=info["name"], mime="image/png", key=f"dl_file_{i}")
+
+    zipb = BytesIO()
+    with zipfile.ZipFile(zipb, "w") as zf:
+        for info in st.session_state["proc_files"]:
+            zf.writestr(info["name"], info["buf"].getvalue())
+    zipb.seek(0)
+    st.download_button("📦 Download All Local ZIP", data=zipb, file_name="files_processed.zip", mime="application/zip")
