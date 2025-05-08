@@ -166,3 +166,6 @@ if st.session_state.get("proc_files"):
             zf.writestr(info["name"], info["buf"].getvalue())
     zipb.seek(0)
     st.download_button("📦 Download All Local ZIP", data=zipb, file_name="files_processed.zip", mime="application/zip")
+
+if __name__ == "__main__":
+    main()  # or whatever your main function is
